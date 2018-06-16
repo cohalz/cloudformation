@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Notify Slack the number of bookmarks.
+Resources:
+  TotalBookMarksNotifier:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import os
+          import json
+          import urllib.request
+          import re
+          
+          def handler(event, context):
+              bookmark_url = event['bookmark_url']
+              message = bookmark_url + ' のブックマーク総数: '
+              total_count = get_total_count(bookmark_url)
+              total = total_count['total_bookmarks']
+              env_key = re.sub(r'^[^a-zA-Z]|[^a-zA-Z0-9\_]', '', bookmark_url)
+              
+              prev_tmp = os.getenv(env_key)
+              if prev_tmp != None:
+                  prev_total = int(prev_tmp)
+                  message  += str(total) + '(' + get_delta_str(total, prev_total) + ')'
+                  if total != prev_total:
+                      update_variables(env_key, total, context.function_name)
+              else:
+                  message += str(total)
+                  update_variables(env_key, total, context.function_name)
+              
+              print(message)
+              post_to_slack(event['slack_url'], message)
+          
+              return total_count
+              
+          def get_total_count(bookmark_url):
+              params = urllib.parse.urlencode({'url': bookmark_url})
+              api_url = 'http://api.b.st-hatena.com/entry.total_count?' + params
+              
+              with urllib.request.urlopen(api_url) as response:
+                  return json.loads(response.read().decode('utf-8'))
+          
+          def update_variables(env_key, total, function_name):
+              env = {}
+              for key, value in os.environ.items():
+                  if key.startswith('http'):
+                      env[key] = value
+              env[env_key] = str(total)
+          
+              client = boto3.client('lambda')
+          
+              return client.update_function_configuration(
+                  FunctionName=function_name,
+                  Environment={
+                      'Variables': env
+                  })
+          
+          def post_to_slack(slack_url, text):
+              json_data = json.dumps({'text': text}).encode('utf-8')
+              request = urllib.request.Request(slack_url, data=json_data, method='POST')
+              with urllib.request.urlopen(request) as response:
+                  return response.read().decode('utf-8')
+          
+          def get_delta_str(x, y):
+              delta = x - y
+              if delta >= 0:
+                  return '+' + str(delta)
+              else:
+                  return str(delta)
+
+      Description: Notify Slack the number of bookmarks.
+      FunctionName: total-bookmarks-notifier
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt RoleForTotalBookMarksNotifier.Arn
+      Runtime: python3.6
+      Timeout: 10
+
+  RoleForTotalBookMarksNotifier:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "role-for-total-bookmarks-notifier"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: PolicyForTotalBookMarksNotifier
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+                - Effect: Allow
+                  Action: "lambda:UpdateFunctionConfiguration"
+                  Resource: "*"
+
+  PermissionForEventsToInvokeLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName:
+        Ref: "TotalBookMarksNotifier"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventForTotalBookMarksNotifier.Arn
+
+  EventForTotalBookMarksNotifier:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: "Notify the number of bookmarks at 9 o'clock every day"
+      Name: "event-for-total-bookmarks-notifier"
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt TotalBookMarksNotifier.Arn
+          Id: "total-bookmarks-notifier"
+          Input: >
+            {
+              "bookmark_url": "http://example.com",
+              "slack_url": "https://hooks.slack.com/services/XXXXXXXXX/XXXXXXXXX/xxxxxxxxxxxxxxxxxxxxxxxx"
+            }
